@@ -103,7 +103,10 @@ def guardrail_validate(
                 sanitized.append(_make_fallback_noop(idx, "Invalid or missing solar factor"))
                 continue
             factor_val = float(factor)
-            if 1.0 < factor_val <= 100.0:
+            # Only treat as a percentage if the LLM returned a clear whole-number percentage
+            # (e.g. 50 meaning 50% → 0.5). Values in (1.0, 10.0) such as 1.5 or 1.2 are
+            # simply out-of-range factors and must be rejected, not silently scaled.
+            if 10.0 <= factor_val <= 100.0:
                 factor_val = factor_val / 100.0
             if not (0.0 <= factor_val <= 1.0):
                 sanitized.append(_make_fallback_noop(idx, f"Solar reduction factor {factor} out of range [0, 1]"))
@@ -116,15 +119,28 @@ def guardrail_validate(
                 sanitized.append(_make_fallback_noop(idx, "Invalid or missing minimum_energy_kwh"))
                 continue
             min_val = float(min_kwh)
-            if min_val < 0.0 or min_val > req.battery.capacity_kwh:
+            if min_val < 0.0:
                 sanitized.append(
-                    _make_fallback_noop(
-                        idx,
-                        f"Reserve {min_val} kWh out of range [0, capacity={req.battery.capacity_kwh}]",
-                    )
+                    _make_fallback_noop(idx, f"Reserve {min_val} kWh is negative")
                 )
                 continue
+            # Hard ceiling: reserve must leave at least one discharge step of headroom below capacity,
+            # and must not exceed initial_energy_kwh (or hour-0 SOC constraint is immediately infeasible).
+            safe_ceiling = min(
+                req.battery.capacity_kwh - req.battery.max_discharge_kwh_per_hour,
+                req.battery.initial_energy_kwh,
+            )
+            # Also ensure ceiling is at least the battery's own base minimum
+            safe_ceiling = max(safe_ceiling, float(req.battery.minimum_energy_kwh))
+            if min_val > safe_ceiling:
+                logger.warning(
+                    f"note_index={idx}: minimum_battery_reserve {min_val} kWh clamped to "
+                    f"safe ceiling {safe_ceiling} kWh (capacity={req.battery.capacity_kwh}, "
+                    f"initial={req.battery.initial_energy_kwh})"
+                )
+                min_val = safe_ceiling
             clean_adj["minimum_energy_kwh"] = round(min_val, 4)
+
 
         elif dtype == "max_grid_window":
             max_grid = adj.get("max_grid_kwh")

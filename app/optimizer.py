@@ -60,15 +60,21 @@ def solve_energy_optimization(
         if h_grid_cap < float("inf"):
             model += grid[h] <= h_grid_cap
 
-    # 8. End of day neutrality requirement
-    model += soc[23] == battery.initial_energy_kwh
+    # 8. End of day neutrality: final SOC must be >= initial (at least restore starting level)
+    model += soc[23] >= battery.initial_energy_kwh
 
     # Solve using CBC quietly
     solver = pulp.PULP_CBC_CMD(msg=False)
     solver_status = model.solve(solver)
 
     if pulp.LpStatus[solver_status] != "Optimal":
-        raise ValueError(f"Energy optimization solver did not find an optimal solution. Status: {pulp.LpStatus[solver_status]}")
+        status_str = pulp.LpStatus[solver_status]
+        raise ValueError(
+            f"Energy optimization failed ({status_str}). "
+            "Directive constraints may conflict with battery physics or grid limits. "
+            "Ensure no_charge/no_discharge windows allow enough flexibility to meet demand."
+        )
+
 
     hourly_plan: list[HourlyPlanEntry] = []
     total_grid = 0.0

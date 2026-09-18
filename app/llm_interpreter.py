@@ -9,90 +9,32 @@ from app.config import GEMINI_API_KEY, LLM_MODEL
 
 logger = logging.getLogger("gridwise.interpreter")
 
-SYSTEM_PROMPT = """You are an expert energy grid operator interpreter. Your sole job is to translate 1-3 operator notes into structured directive interpretation JSON objects for a 24-hour energy optimization model (hours 0 to 23).
+TIMEOUT_SECONDS = 120
+MAX_RETRIES = 3
 
-### Directive Reference Table:
-1. "solar_reduction":
-   - structured_adjustment: {"hours": [int, ...], "factor": float}
-   - "factor" MUST BE the fraction of solar power REMAINING.
-     - Example: "80% reduction" -> factor = 0.2 (20% remaining).
-     - Example: "solar drops to 25% of forecast" -> factor = 0.25 (25% remaining).
-     - Example: "solar drops by 25%" -> factor = 0.75 (75% remaining).
+SYSTEM_PROMPT = """You are an expert energy grid operator interpreter. Your sole job is to translate operator notes into structured directive interpretation JSON objects for a 24-hour energy optimization model (hours 0 to 23).
 
-2. "minimum_battery_reserve":
-   - structured_adjustment: {"hours": [int, ...], "minimum_energy_kwh": float}
-   - Note: minimum_energy_kwh must be a non-negative float in kWh. If specified as percentage of battery capacity (e.g. 50% of 20 kWh = 10 kWh), calculate the kWh if capacity is stated in the note, or state the absolute kWh amount.
+Directive Reference:
+1. solar_reduction: structured_adjustment={"hours":[...],"factor":float} where factor=fraction REMAINING (80% reduction->factor=0.2; drops TO 25%->factor=0.25; drops BY 25%->factor=0.75)
+2. minimum_battery_reserve: structured_adjustment={"hours":[...],"minimum_energy_kwh":float}
+3. no_charge_window: structured_adjustment={"hours":[...]}
+4. no_discharge_window: structured_adjustment={"hours":[...]}
+5. max_grid_window: structured_adjustment={"hours":[...],"max_grid_kwh":float}
+6. no_op: structured_adjustment=null (purely informational notes)
 
-3. "no_charge_window":
-   - structured_adjustment: {"hours": [int, ...]}
+CRITICAL RULES:
+- Hours are START-INCLUSIVE END-EXCLUSIVE integers 0-23 sorted ascending unique: 1PM to 3PM->[13,14]; 9AM to 12PM->[9,10,11]
+- Emit EXACTLY one JSON object per note with note_index=0,1,...,N-1
+- no_op is the ONLY type where applies=false; all other types must have applies=true
+- NEVER use a directive_type outside the 6 types above
+- NEVER modify demand or tariff values
 
-4. "no_discharge_window":
-   - structured_adjustment: {"hours": [int, ...]}
+Examples:
+Input: ["Solar output will drop 75% from 1PM to 3PM"]
+Output: [{"note_index":0,"applies":true,"directive_type":"solar_reduction","structured_adjustment":{"hours":[13,14],"factor":0.25},"explanation":"75% drop leaves 25% remaining"}]
 
-5. "max_grid_window":
-   - structured_adjustment: {"hours": [int, ...], "max_grid_kwh": float}
-
-6. "no_op":
-   - structured_adjustment: null
-   - Use "no_op" if the note does NOT affect the 24h battery/solar/grid operating schedule or is purely informational.
-
-### CRITICAL RULES:
-- Hour windows are START-INCLUSIVE and END-EXCLUSIVE:
-  - "1 PM to 3 PM" -> 13:00 to 15:00 -> hours [13, 14].
-  - "9 AM to 12 PM" -> 09:00 to 12:00 -> hours [9, 10, 11].
-  - "all day" / "entire day" -> hours [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23].
-- "hours" arrays MUST be unique, sorted ascending integers within 0..23.
-- Emit EXACTLY one item per input note, with note_index matching 0, 1, ..., N-1.
-- "no_op" is the ONLY directive where "applies" can be false. For all other directive types, "applies" must be true.
-- NEVER invent a directive_type outside the 6 supported types.
-- NEVER modify demand or electricity tariff directly.
-
-### Few-Shot Examples:
-Example 1:
-Input operator_notes: ["Solar production between 1 PM and 3 PM will suffer a roughly 75% drop due to cloud cover."]
-Output JSON:
-[
-  {
-    "note_index": 0,
-    "applies": true,
-    "directive_type": "solar_reduction",
-    "structured_adjustment": {"hours": [13, 14], "factor": 0.25},
-    "explanation": "75% drop in solar output from 1 PM to 3 PM leaves 25% factor remaining for hours 13 and 14."
-  }
-]
-
-Example 2:
-Input operator_notes: ["Maintain at least 10 kWh battery reserve from 6 PM to 10 PM."]
-Output JSON:
-[
-  {
-    "note_index": 0,
-    "applies": true,
-    "directive_type": "minimum_battery_reserve",
-    "structured_adjustment": {"hours": [18, 19, 20, 21], "minimum_energy_kwh": 10.0},
-    "explanation": "Set minimum battery reserve to 10 kWh for hours 18 through 21."
-  }
-]
-
-Example 3:
-Input operator_notes: ["Do not charge the battery during peak hours 5 PM to 9 PM.", "Routine maintenance logged."]
-Output JSON:
-[
-  {
-    "note_index": 0,
-    "applies": true,
-    "directive_type": "no_charge_window",
-    "structured_adjustment": {"hours": [17, 18, 19, 20]},
-    "explanation": "Prohibit charging during peak window hours 17 to 20."
-  },
-  {
-    "note_index": 1,
-    "applies": false,
-    "directive_type": "no_op",
-    "structured_adjustment": null,
-    "explanation": "Informational maintenance note; no operational constraints required."
-  }
-]
+Input: ["Keep at least 10 kWh in battery from 6PM to 9PM","Routine log entry."]
+Output: [{"note_index":0,"applies":true,"directive_type":"minimum_battery_reserve","structured_adjustment":{"hours":[18,19,20],"minimum_energy_kwh":10.0},"explanation":"Reserve 10kWh hours 18-20"},{"note_index":1,"applies":false,"directive_type":"no_op","structured_adjustment":null,"explanation":"Informational only"}]
 """
 
 
@@ -110,10 +52,6 @@ def _get_fallback_directives(operator_notes: list[str]) -> list[dict[str, Any]]:
 
 
 async def interpret_operator_notes(operator_notes: list[str]) -> list[dict[str, Any]]:
-    """
-    Calls Gemini API to parse free-text operator notes into raw directive objects.
-    Enforces a strict 10s timeout and returns fallback no_ops on any failure.
-    """
     if not GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY not configured. Falling back to all no_op directives.")
         return _get_fallback_directives(operator_notes)
@@ -133,17 +71,31 @@ async def interpret_operator_notes(operator_notes: list[str]) -> list[dict[str, 
         )
         return response.text or ""
 
-    try:
-        raw_text = await asyncio.wait_for(asyncio.to_thread(_sync_call), timeout=10.0)
-        parsed = json.loads(raw_text)
-        if isinstance(parsed, list):
-            return parsed
-        logger.warning(f"LLM did not return a JSON list: {raw_text}")
-        return _get_fallback_directives(operator_notes)
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            logger.info(f"LLM call attempt {attempt}/{MAX_RETRIES} (timeout={TIMEOUT_SECONDS}s)...")
+            raw_text = await asyncio.wait_for(asyncio.to_thread(_sync_call), timeout=float(TIMEOUT_SECONDS))
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, list):
+                logger.info(f"LLM returned {len(parsed)} directive(s) on attempt {attempt}.")
+                return parsed
+            logger.warning(f"LLM did not return a JSON list: {raw_text}")
+            return _get_fallback_directives(operator_notes)
+        except asyncio.TimeoutError as e:
+            last_error = e
+            logger.warning(f"LLM attempt {attempt} timed out after {TIMEOUT_SECONDS}s.")
+        except json.JSONDecodeError as e:
+            last_error = e
+            logger.warning(f"LLM attempt {attempt} returned non-JSON: {e}")
+        except Exception as e:
+            last_error = e
+            logger.error(f"LLM attempt {attempt} error: {e}", exc_info=True)
 
-    except asyncio.TimeoutError:
-        logger.error("LLM API call timed out (10s threshold). Falling back to safe no_ops.")
-        return _get_fallback_directives(operator_notes)
-    except Exception as e:
-        logger.error(f"Error calling LLM API: {e}", exc_info=True)
-        return _get_fallback_directives(operator_notes)
+        if attempt < MAX_RETRIES:
+            wait_seconds = 2 ** attempt
+            logger.info(f"Retrying in {wait_seconds}s...")
+            await asyncio.sleep(wait_seconds)
+
+    logger.error(f"All {MAX_RETRIES} LLM attempts failed. Falling back to safe no_ops.")
+    return _get_fallback_directives(operator_notes)

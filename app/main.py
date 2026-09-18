@@ -70,8 +70,21 @@ async def optimize_energy(req: OptimizeEnergyRequest):
     # 3. Directive engine constraint building
     constraint_arrays = build_constraint_arrays(req.hours, req.battery, directives)
 
-    # 4. LP optimization solve
-    hourly_plan, totals = solve_energy_optimization(req.hours, req.battery, constraint_arrays)
+    # 4. LP optimization solve — catch infeasibility cleanly
+    try:
+        hourly_plan, totals = solve_energy_optimization(req.hours, req.battery, constraint_arrays)
+    except ValueError as exc:
+        logger.error(f"LP solver infeasible for scenario '{req.scenario_id}': {exc}")
+        return JSONResponse(
+            status_code=422,
+            content={
+                "scenario_id": req.scenario_id,
+                "error": "Optimization infeasible",
+                "detail": str(exc),
+                "directive_interpretation": [d.model_dump() for d in directives],
+            },
+        )
+
 
     # 5. Internal replay validation check
     replay_validate(hourly_plan, req, directives, totals)
