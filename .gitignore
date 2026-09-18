@@ -1,5 +1,21 @@
+# Secrets and environment
 .env
-.venv/
+.env.*
+!.env.example
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
 .pytest_cache/
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local-only debug scripts (not part of the rubric deliverable)
+run_mixed001_venv.py
