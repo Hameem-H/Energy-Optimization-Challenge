@@ -100,10 +100,10 @@ def replay_validate(
 
         prev_soc = soc
 
-    # 7. End of day neutrality check
-    if abs(prev_soc - req.battery.initial_energy_kwh) > TOL:
+    # 7. End-of-day neutrality check (LP constraint is soc[23] >= initial; SoC may finish higher)
+    if prev_soc + TOL < req.battery.initial_energy_kwh:
         raise ValueError(
-            f"Replay validation failed: end-of-day SoC {prev_soc:.4f} != initial SoC {req.battery.initial_energy_kwh:.4f}"
+            f"Replay validation failed: end-of-day SoC {prev_soc:.4f} < initial SoC {req.battery.initial_energy_kwh:.4f}"
         )
 
     # 8. Totals check

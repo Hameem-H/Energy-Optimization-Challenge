@@ -119,26 +119,27 @@ def guardrail_validate(
                 sanitized.append(_make_fallback_noop(idx, "Invalid or missing minimum_energy_kwh"))
                 continue
             min_val = float(min_kwh)
+
+            # Rule 1: must be non-negative
             if min_val < 0.0:
+                sanitized.append(_make_fallback_noop(idx, f"Reserve {min_val} kWh is negative"))
+                continue
+
+            # Rule 2: must not exceed battery capacity
+            if min_val > req.battery.capacity_kwh:
                 sanitized.append(
-                    _make_fallback_noop(idx, f"Reserve {min_val} kWh is negative")
+                    _make_fallback_noop(
+                        idx,
+                        f"Reserve {min_val} kWh exceeds battery capacity of {req.battery.capacity_kwh} kWh",
+                    )
                 )
                 continue
-            # Hard ceiling: reserve must leave at least one discharge step of headroom below capacity,
-            # and must not exceed initial_energy_kwh (or hour-0 SOC constraint is immediately infeasible).
-            safe_ceiling = min(
-                req.battery.capacity_kwh - req.battery.max_discharge_kwh_per_hour,
-                req.battery.initial_energy_kwh,
-            )
-            # Also ensure ceiling is at least the battery's own base minimum
-            safe_ceiling = max(safe_ceiling, float(req.battery.minimum_energy_kwh))
-            if min_val > safe_ceiling:
-                logger.warning(
-                    f"note_index={idx}: minimum_battery_reserve {min_val} kWh clamped to "
-                    f"safe ceiling {safe_ceiling} kWh (capacity={req.battery.capacity_kwh}, "
-                    f"initial={req.battery.initial_energy_kwh})"
-                )
-                min_val = safe_ceiling
+
+            # NOTE: reachability from the current SOC is a FEASIBILITY concern, not a
+            # value-validation concern. The guardrail only enforces: finite, non-negative,
+            # and <= battery capacity. Whether this reserve makes the LP infeasible is
+            # detected later and should be surfaced as an infeasibility, not silently
+            # downgraded to no_op.
             clean_adj["minimum_energy_kwh"] = round(min_val, 4)
 
 
